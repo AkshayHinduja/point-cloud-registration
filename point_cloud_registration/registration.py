@@ -68,46 +68,53 @@ class Registration:
         return H, g, e2
 
 
-    def align(self, source, init_T=np.eye(4), verbose=False):
+    def align(self, source, init_T=np.eye(4), verbose=False,
+              use_solution_remapping=False, sr_lambda_threshold=None):
         """
-        use Gauss-Newton method to find the transformation 
-        that aligns the source point cloud to the target point cloud.
+        Gauss-Newton ICP alignment.
+
         :param source: Source point cloud (Nx3 array).
         :param init_T: Initial transformation (4x4 array).
         :param verbose: Print error at each iteration.
+        :param use_solution_remapping: If True, zero the step in degenerate Hessian
+            eigenvector directions at each iteration (SR mode).
+        :param sr_lambda_threshold: Override the condition-number threshold for SR.
+            None = adaptive (sqrt(lambda_max / lambda_min)).
         :return: Final transformation (4x4 array).
         """
         if self.is_target_set() is False:
             raise ValueError("Target is not set.")
 
+        if use_solution_remapping:
+            from mbes_localization.localization.degeneracy import analyse_hessian, apply_sr_solve
+
         source = source.astype(np.float32)
         cur_T = init_T
-        # dx_norm = np.inf
-        # best_T = cur_T
-        # best_error = np.inf
-        # source = source.astype(np.float32)
+        H_final = None
+
         for i in range(self.max_iter):
             H, g, e2 = self.calc_H_g_e2(cur_T, source)
+            H_final = H
+
             if verbose:
                 print(f"iter {i}, error {e2}")
 
-            # # ensure the error is decreasing
-            # if e2 < best_error:
-            #     best_error = e2
-            #     best_T = cur_T.copy()
-            # else:
-            #     break
+            if use_solution_remapping:
+                deg = analyse_hessian(H.astype(float), lambda_threshold=sr_lambda_threshold)
+                dx = apply_sr_solve(H.astype(float), g.astype(float), deg)
+            else:
+                dx = -np.linalg.solve(H, g)
 
-            
-            # solve the linear system
-            dx = -np.linalg.solve(H, g)
-    
-            # check convergence
             dx_norm = np.linalg.norm(dx)
             if dx_norm < self.tol:
                 break
 
-            # Update transformation
             cur_T = plus(cur_T, dx)
 
+        self._last_hessian = H_final
         return cur_T
+
+    @property
+    def last_hessian(self):
+        """Return the 6×6 Hessian from the most recent align() call, or None."""
+        return getattr(self, '_last_hessian', None)
