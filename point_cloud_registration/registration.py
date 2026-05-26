@@ -91,6 +91,7 @@ class Registration:
         source = source.astype(np.float32)
         cur_T = init_T
         H_final = None
+        converged = False
 
         for i in range(self.max_iter):
             H, g, e2 = self.calc_H_g_e2(cur_T, source)
@@ -107,10 +108,14 @@ class Registration:
 
             dx_norm = np.linalg.norm(dx)
             if dx_norm < self.tol:
+                converged = True
                 break
 
             cur_T = plus(cur_T, dx)
 
+        # If max_iter was exhausted, cur_T advanced past the last H computation — recompute.
+        if not converged and H_final is not None:
+            H_final, _, _ = self.calc_H_g_e2(cur_T, source)
         self._last_hessian = H_final
         return cur_T
 
