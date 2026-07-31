@@ -10,13 +10,22 @@ from point_cloud_registration.math_tools import skews, transform_points, skew, s
 
 
 class VPlaneICP(Registration):
-    def __init__(self, voxel_size=1.0, max_iter=30, max_dist=2, tol=1e-3):
+    def __init__(self, voxel_size=1.0, max_iter=30, max_dist=2, tol=1e-3,
+                 min_points=10, cov_reg=0.0):
+        """
+        :param min_points: Voxels holding fewer points than this are discarded.
+        :param cov_reg: Isotropic shift added to every per-voxel covariance,
+            which keeps coplanar voxels non-singular. 0.0 disables it.
+        """
         super().__init__(max_iter=max_iter, tol=tol)
         self.voxel_size = voxel_size
         self.max_dist = max_dist
+        self.min_points = min_points
+        self.cov_reg = cov_reg
 
     def set_target(self, target):
-        self.voxels = VoxelGrid(self.voxel_size)
+        self.voxels = VoxelGrid(self.voxel_size, min_points=self.min_points,
+                                cov_reg=self.cov_reg)
         self.voxels.set_points(target)
         self._is_target_set = True
 
