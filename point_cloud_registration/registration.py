@@ -5,6 +5,7 @@ Distributed under MIT license. See LICENSE for more information.
 
 import numpy as np
 from point_cloud_registration.math_tools import plus
+from point_cloud_registration.degeneracy import analyse_hessian, apply_sr_solve
 
 
 class Registration:
@@ -69,7 +70,8 @@ class Registration:
 
 
     def align(self, source, init_T=np.eye(4), verbose=False,
-              use_solution_remapping=False, sr_lambda_threshold=None):
+              use_solution_remapping=False, sr_lambda_threshold=None,
+              lm_damping=False):
         """
         Gauss-Newton ICP alignment.
 
@@ -80,13 +82,21 @@ class Registration:
             eigenvector directions at each iteration (SR mode).
         :param sr_lambda_threshold: Override the condition-number threshold for SR.
             None = adaptive (sqrt(lambda_max / lambda_min)).
+        :param lm_damping: If True, solve the damped system (H + lambda*I) dx = -g
+            instead of H dx = -g, with lambda scaled to the trace of H
+            (Levenberg-Marquardt). This keeps the linear solve well posed on
+            geometry that leaves H singular or near-singular — a single flat
+            surface, a straight corridor, too few correspondences — where the
+            plain solve raises numpy.linalg.LinAlgError or returns a step
+            dominated by noise. On well-conditioned data the damping is small
+            enough to leave the solution unchanged. Pair it with
+            use_solution_remapping when the Hessian may be exactly rank
+            deficient: the degeneracy analysis runs on the raw H so the
+            classification stays honest, while the solve uses the damped one.
         :return: Final transformation (4x4 array).
         """
         if self.is_target_set() is False:
             raise ValueError("Target is not set.")
-
-        if use_solution_remapping:
-            from mbes_localization.localization.degeneracy import analyse_hessian, apply_sr_solve
 
         source = source.astype(np.float32)
         cur_T = init_T
@@ -100,9 +110,24 @@ class Registration:
             if verbose:
                 print(f"iter {i}, error {e2}")
 
+            if lm_damping:
+                trace_H = np.trace(H)
+                lambda_lm = max(1e-4 * trace_H / 6.0 if trace_H > 0 else 1e-3, 1e-6)
+                H_solve = H + lambda_lm * np.eye(6)
+            else:
+                H_solve = H
+
             if use_solution_remapping:
+                # Eigendecompose the raw H (correct degeneracy thresholding) but
+                # solve on H_solve (numerical stability): an isotropic +lambda*I
+                # shift leaves the eigenvectors identical.
                 deg = analyse_hessian(H.astype(float), lambda_threshold=sr_lambda_threshold)
-                dx = apply_sr_solve(H.astype(float), g.astype(float), deg)
+                dx = apply_sr_solve(H_solve.astype(float), g.astype(float), deg)
+            elif lm_damping:
+                try:
+                    dx = -np.linalg.solve(H_solve, g)
+                except np.linalg.LinAlgError:
+                    dx = -np.linalg.lstsq(H_solve, g, rcond=None)[0]
             else:
                 dx = -np.linalg.solve(H, g)
 
