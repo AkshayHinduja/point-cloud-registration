@@ -14,4 +14,5 @@ from point_cloud_registration.degeneracy import (
     apply_sr_solve,
     DecoupledDegeneracyResult,
     analyse_hessian_decoupled,
+    dcreg_solve,
 )

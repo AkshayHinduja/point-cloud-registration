@@ -5,7 +5,12 @@ Distributed under MIT license. See LICENSE for more information.
 
 import numpy as np
 from point_cloud_registration.math_tools import plus
-from point_cloud_registration.degeneracy import analyse_hessian, apply_sr_solve
+from point_cloud_registration.degeneracy import (
+    analyse_hessian,
+    apply_sr_solve,
+    analyse_hessian_decoupled,
+    dcreg_solve,
+)
 
 
 class Registration:
@@ -71,7 +76,9 @@ class Registration:
 
     def align(self, source, init_T=np.eye(4), verbose=False,
               use_solution_remapping=False, sr_lambda_threshold=None,
-              lm_damping=False):
+              lm_damping=False,
+              dcreg_mode=None, dcreg_kappa_threshold=10.0, dcreg_kappa_target=None,
+              dcreg_pcg_tolerance=1e-6, dcreg_pcg_max_iterations=10):
         """
         Gauss-Newton ICP alignment.
 
@@ -93,8 +100,38 @@ class Registration:
             use_solution_remapping when the Hessian may be exactly rank
             deficient: the degeneracy analysis runs on the raw H so the
             classification stays honest, while the solve uses the damped one.
+        :param dcreg_mode: None (default), 'pcg' or 'clamped'. Enables the
+            DCReg-style decoupled mitigation solve (Hu et al., IJRR 2026,
+            arXiv:2509.06285) in place of the plain Gauss-Newton one. Each
+            iteration analyses the RAW H per block via Schur complements and
+            solves through degeneracy.dcreg_solve. Read that function's
+            docstring before choosing a mode — in particular, 'pcg' solves the
+            unmodified normal equations and so returns the plain Gauss-Newton
+            step at full convergence; it improves conditioning, it does not move
+            the minimum. 'clamped' does move it, along the flagged axes only.
+            Mutually exclusive with use_solution_remapping: both are mitigation
+            strategies for the same problem and stacking them is described by
+            neither paper.
+        :param dcreg_kappa_threshold: Per-block eigenvalue-ratio threshold above
+            which an axis is called degenerate (passed through to
+            analyse_hessian_decoupled).
+        :param dcreg_kappa_target: Target ratio used when clamping the flagged
+            eigenvalues. None = same as dcreg_kappa_threshold.
+        :param dcreg_pcg_tolerance: Convergence tolerance for dcreg_mode='pcg'.
+        :param dcreg_pcg_max_iterations: Iteration budget for dcreg_mode='pcg'
+            (floored at 6 inside the solver).
         :return: Final transformation (4x4 array).
         """
+        if dcreg_mode is not None and dcreg_mode not in ('pcg', 'clamped'):
+            raise ValueError(
+                f"Unknown dcreg_mode {dcreg_mode!r}; expected None, 'pcg' or 'clamped'"
+            )
+        if dcreg_mode is not None and use_solution_remapping:
+            raise ValueError(
+                "dcreg_mode and use_solution_remapping are mutually exclusive "
+                "mitigation strategies; enable at most one."
+            )
+
         if self.is_target_set() is False:
             raise ValueError("Target is not set.")
 
@@ -123,6 +160,24 @@ class Registration:
                 # shift leaves the eigenvectors identical.
                 deg = analyse_hessian(H.astype(float), lambda_threshold=sr_lambda_threshold)
                 dx = apply_sr_solve(H_solve.astype(float), g.astype(float), deg)
+            elif dcreg_mode is not None:
+                # Same composition rule as the SR path above: characterize the
+                # RAW H (damping would inflate the small eigenvalues before the
+                # ratio test sees them, under-reporting degeneracy) but solve
+                # H_solve.  Note that combining lm_damping with dcreg_mode is an
+                # extension beyond the paper, which damps nothing and relies on
+                # the clamped spectrum alone; it is off by default.
+                deg = analyse_hessian_decoupled(
+                    H.astype(float),
+                    kappa_threshold=dcreg_kappa_threshold,
+                    kappa_target=dcreg_kappa_target,
+                )
+                dx = dcreg_solve(
+                    H_solve.astype(float), g.astype(float), deg,
+                    mode=dcreg_mode,
+                    pcg_tolerance=dcreg_pcg_tolerance,
+                    pcg_max_iterations=dcreg_pcg_max_iterations,
+                )[0]
             elif lm_damping:
                 try:
                     dx = -np.linalg.solve(H_solve, g)
