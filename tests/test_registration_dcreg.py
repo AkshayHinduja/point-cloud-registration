@@ -7,15 +7,25 @@ Fixtures and style mirror ``tests/test_registration_align.py``.
 The unit-level behaviour of the solver lives in ``tests/test_dcreg_solve.py``;
 what is tested here is the *wiring*: parameter validation, that the default path
 is untouched, and what each mode actually does to a real ICP loop on real
-geometry.
+geometry.  For a side-by-side comparison of *all* the mitigation strategies
+(plain GN, LM damping, solution remapping, and both DCReg modes) on these same
+fixtures, see ``tests/test_mitigation_ab.py``.
+
+The cloud pairs themselves are built by ``tests/fixtures_degenerate.py`` so that
+this file and the A/B file measure identical geometry.
 """
 
 import numpy as np
 import pytest
 
 from point_cloud_registration.plane_icp import PlaneICP
-from point_cloud_registration.math_tools import expSO3, makeT
 from point_cloud_registration.degeneracy import analyse_hessian_decoupled
+
+from fixtures_degenerate import (
+    build_flat_plane_pair,
+    build_near_degenerate_pair,
+    build_well_conditioned_pair,
+)
 
 
 @pytest.fixture
@@ -27,21 +37,7 @@ def well_conditioned_pair():
 
     Returns (target, source, T_true).
     """
-    rng = np.random.default_rng(0)
-    n = 400
-    a = rng.uniform(0.0, 4.0, size=(n, 2))
-    b = rng.uniform(0.0, 4.0, size=(n, 2))
-    c = rng.uniform(0.0, 4.0, size=(n, 2))
-    face_z = np.column_stack([a[:, 0], a[:, 1], np.zeros(n)])
-    face_x = np.column_stack([np.zeros(n), b[:, 0], b[:, 1]])
-    face_y = np.column_stack([c[:, 0], np.zeros(n), c[:, 1]])
-    target = np.vstack([face_z, face_x, face_y])
-
-    R = expSO3(np.array([0.02, -0.03, 0.05]))
-    t = np.array([0.15, -0.1, 0.08])
-    source = (R @ target.T).T + t
-    T_true = np.linalg.inv(makeT(R, t))
-    return target, source, T_true
+    return build_well_conditioned_pair()
 
 
 @pytest.fixture
@@ -52,11 +48,7 @@ def degenerate_pair():
     Every surface normal is (0, 0, 1), so the Jacobian rows are
     [0, 0, 1, y, -x, 0]: tx, ty and wz never appear and H is exactly rank 3.
     """
-    g = np.arange(-5.0, 5.0 + 1e-9, 1.0)
-    xx, yy = np.meshgrid(g, g)
-    target = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(xx.size)])
-    source = target + np.array([0.0, 0.0, 0.5])
-    return target, source
+    return build_flat_plane_pair()
 
 
 @pytest.fixture
@@ -79,12 +71,7 @@ def near_degenerate_pair():
     what lets these tests show that 'clamped' suppresses a correction the data
     actually supported.
     """
-    g = np.arange(-5.0, 5.0 + 1e-9, 0.5)
-    xx, yy = np.meshgrid(g, g)
-    zz = 0.05 * (xx ** 2 + 1.3 * yy ** 2) / 10.0
-    target = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
-    source = target + np.array([0.6, 0.2, 0.5])
-    return target, source
+    return build_near_degenerate_pair()
 
 
 def _yaw(T):

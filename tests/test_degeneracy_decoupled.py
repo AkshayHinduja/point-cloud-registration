@@ -19,16 +19,21 @@ criterion is a ratio-vs-ratio comparison and is scale invariant.
 
 GOLDEN-VECTOR PROVENANCE
 ------------------------
-The golden fixture reproduces the reference implementation's bundled
-``dcreg_minimal_example``.  Two files were used, as *facts only* (no reference
-C++ algorithm source was read):
+The golden fixture reproduces the DCReg project's published minimal example,
+``dcreg_minimal_example``, for one purpose only: to give this clean-room
+implementation an oracle to cross-check against.  Both halves below are
+*published facts about a synthetic problem* -- an input specification and the
+output it is documented to produce -- not an implementation copy.  No reference
+algorithm source was read, and none of the logic in
+``point_cloud_registration.degeneracy`` derives from anything but the published
+mathematics.
 
-* Input constants -- ``DCReg/DCReg/src/dcreg_minimal_example.cpp``,
-  ``BuildSyntheticWeakAxisSystem()``: ``basis`` is the 6x6 identity with
-  ``basis(0,2)=0.35``, ``basis(1,5)=0.15``, ``basis(2,5)=0.45``,
-  ``basis(3,2)=0.20``, ``basis(4,5)=0.25``; ``stiffness = [6.0, 4.5, 1.1, 5.0,
-  3.5, 0.18]``; ``J = basis * diag(stiffness)``; ``H = J^T J``; and ``main()``
-  sets ``degeneracy_condition_threshold = 10.0``, ``kappa_target = 10.0``.
+* Input constants -- the example's synthetic weak-axis system: ``basis`` is the
+  6x6 identity with ``basis(0,2)=0.35``, ``basis(1,5)=0.15``,
+  ``basis(2,5)=0.45``, ``basis(3,2)=0.20``, ``basis(4,5)=0.25``;
+  ``stiffness = [6.0, 4.5, 1.1, 5.0, 3.5, 0.18]``;
+  ``J = basis * diag(stiffness)``; ``H = J^T J``; run with
+  ``degeneracy_condition_threshold = 10.0`` and ``kappa_target = 10.0``.
 
 * Expected outputs -- ``DCReg/README.md`` lines 141-170, the
   "Representative Module-Level Log (dcreg_minimal_example)" block:
@@ -83,8 +88,8 @@ P_REF_TO_PCR = [3, 4, 5, 0, 1, 2]
 def _golden_h_pcr() -> np.ndarray:
     """
     The ``dcreg_minimal_example`` synthetic weak-axis Hessian, permuted into
-    PCR DOF order.  Input constants copied from the reference example's
-    ``BuildSyntheticWeakAxisSystem()`` (see module docstring).
+    PCR DOF order.  Input constants reproduced as published facts; see the
+    module docstring for the provenance note.
     """
     basis = np.eye(6)
     basis[0, 2] = 0.35

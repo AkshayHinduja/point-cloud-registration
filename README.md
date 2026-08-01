@@ -116,6 +116,30 @@ python3 demo_matching.py
 | Generalized ICP (GICP)        | $\sum (T p_i - q_i)^T (C_i^Q + R C_i^P R^T)^{-1} (T p_i - q_i)$ | Point-Based (with covariances) | Moderate | Very High | 
 | Normal Distributions Transform (NDT) | $\sum (T p_i - \mu_i)^T \Sigma_i^{-1} (T p_i - \mu_i)$ | Voxel-Based (with covariances) | Very Fast | Moderate |
 
+## Degeneracy handling
+
+When the scene is geometrically under-determined — a single flat wall, a straight corridor, a surface of revolution — the 6×6 Hessian is rank-deficient or ill conditioned and the plain Gauss-Newton step slides along the unconstrained directions. `align()` offers three independent mitigation families (all **off by default**; the default path is untouched plain Gauss-Newton):
+
+- **`use_solution_remapping=True`** (+ `sr_lambda_threshold`) — solution remapping per Zhang & Singh, *On Degeneracy of Optimization-based State Estimation Problems*, ICRA 2016. Eigen-analyses the 6×6 Hessian and projects the update so its component along every degenerate eigen-direction is zero. Pair it with `lm_damping` when the raw Hessian may be exactly singular. Note the published criterion compares an eigenvalue against `sqrt(λ_max/λ_min)`, so it is *not* invariant to a uniform rescaling of `H`; supply `sr_lambda_threshold` if you have a calibrated curvature floor.
+- **`lm_damping=True`** — trace-scaled Levenberg–Marquardt damping (`H + λI`, `λ = 1e-4·tr(H)/6`). Keeps the linear solve well posed where the plain one raises `LinAlgError`. It does not move the minimum, only the step length, so weak directions converge slowly rather than being suppressed.
+- **`dcreg_mode='pcg' | 'clamped'`** (+ `dcreg_kappa_threshold`, `dcreg_kappa_target`, `dcreg_pcg_tolerance`, `dcreg_pcg_max_iterations`) — decoupled Schur-complement analysis per Hu et al., *DCReg*, IJRR 2026 ([arXiv:2509.06285](https://arxiv.org/abs/2509.06285)); independent implementation from the published mathematics. Detection is per *physical axis* per block and tests a ratio against a ratio, so it is scale invariant and immune to the lever-arm inflation of the rotation block. The two solves differ fundamentally: **`'pcg'`** is a preconditioned CG on the *unmodified* normal equations and therefore returns the plain Gauss-Newton step at convergence — it buys conditioning, not mitigation; **`'clamped'`** adds the per-block spectral deficit along the flagged axes and *does* move the minimum, which means `dcreg_kappa_threshold` decides how much recoverable signal you discard. `dcreg_mode` and `use_solution_remapping` are mutually exclusive.
+
+`analyse_hessian_decoupled(H, kappa_threshold=10.0)` is the standalone detection API — usable without any solver change, e.g. to gate or covariance-weight a registration result downstream.
+
+```python
+from point_cloud_registration import PlaneICP, analyse_hessian_decoupled
+
+icp = PlaneICP(max_iter=30, max_dist=2.0, tol=1e-6)
+icp.set_target(target)
+T = icp.align(source, dcreg_mode='clamped', dcreg_kappa_threshold=10.0)
+
+deg = analyse_hessian_decoupled(icp.last_hessian, kappa_threshold=10.0)
+print(deg.degenerate_mask)   # [tx ty tz wx wy wz]
+print(deg.cond_schur_t, deg.cond_schur_R)
+```
+
+`tests/test_mitigation_ab.py` measures all of the above against each other on shared fixtures and documents what each one costs; run it with `pytest tests/test_mitigation_ab.py -s -k summary_table` for the comparison table.
+
 ---
 
 ## License  
