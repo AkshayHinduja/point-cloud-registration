@@ -19,10 +19,23 @@ exactly rank-deficient ``H``; :func:`apply_sr_solve` still inverts ``H`` to form
 the step, so it requires an invertible one.  Damping a singular Hessian is the
 caller's responsibility — see :func:`apply_sr_solve` for the contract.
 
-Reference:
+A second, independent analysis lives here as well:
+:func:`analyse_hessian_decoupled` splits ``H`` into its translation and rotation
+blocks via Schur complements and classifies each block against its own
+spectrum.  It reports *which physical axis* is unobservable rather than which
+abstract eigen-direction, and its criterion is invariant to a uniform rescaling
+of ``H`` (which :func:`analyse_hessian`'s is not).  The two are separate entry
+points; nothing above changes.
+
+References:
     Zhang & Singh, "On Degeneracy of Optimization-based State Estimation
     Problems", IEEE International Conference on Robotics and Automation
     (ICRA), 2016 — J. Zhang, M. Kaess and S. Singh.
+
+    Hu et al., "DCReg: Decoupled Characterization for Efficient Degenerate
+    LiDAR Registration", International Journal of Robotics Research (IJRR),
+    2026 — arXiv:2509.06285.  (Source of the decoupled Schur analysis; this is
+    an independent implementation written from the published mathematics.)
 
 DOF order
 ---------
@@ -253,3 +266,370 @@ def apply_sr_solve(
     Vf_inv = np.linalg.inv(deg.eigenvectors.T)
     H_inv_g = np.linalg.solve(H, g)
     return -(Vf_inv @ Vu @ H_inv_g)
+
+
+# ===========================================================================
+# Decoupled (Schur-complement) degeneracy analysis
+# ===========================================================================
+#
+# Independent implementation of the detection/characterization mathematics of
+#
+#     Hu et al., "DCReg: Decoupled Characterization for Efficient Degenerate
+#     LiDAR Registration", IJRR 2026, arXiv:2509.06285.
+#
+# Written from the published equations only.
+
+# A block whose 2-norm condition number exceeds this is treated as singular for
+# the purpose of forming a Schur complement.
+_SINGULAR_BLOCK_COND = 1e12
+
+# Floor applied to a block eigenvalue before dividing by it, so a structurally
+# zero (or slightly negative, from round-off) eigenvalue cannot produce inf/nan.
+_LAMBDA_FLOOR = 1e-12
+
+# Floor on a clamped eigenvalue, so downstream inverses stay finite even if a
+# whole block is numerically dead.
+_CLAMP_FLOOR = 1e-9
+
+
+@dataclass
+class DecoupledDegeneracyResult:
+    """
+    Output of :func:`analyse_hessian_decoupled`.
+
+    All 3-vectors and 3×3 matrices are per block: ``*_t`` is the translation
+    block, indexed ``[x, y, z]``, and ``*_R`` is the rotation block, indexed
+    ``[ωx (roll), ωy (pitch), ωz (yaw)]``.  ``degenerate_mask`` is the only
+    6-vector and follows this library's DOF order ``[tx, ty, tz, ωx, ωy, ωz]``.
+
+    Attributes
+    ----------
+    S_t, S_R:
+        The Schur complements ``H_tt - H_tw inv(H_ww) H_wt`` and
+        ``H_ww - H_wt inv(H_tt) H_tw``, symmetrized.  ``S_t`` is the curvature
+        of the translation block *after* the rotation DOFs have been optimally
+        eliminated: the observability that translation actually owns.
+    eigenvalues_t, eigenvalues_R:
+        Ascending eigenvalues of the corresponding Schur complement (raw, as
+        returned by ``eigh``).
+    eigenvectors_t, eigenvectors_R:
+        The matching eigenvectors as *columns*, raw (same order as the
+        eigenvalues).
+    aligned_lambda_t, aligned_lambda_R:
+        The same eigenvalues, relabelled per physical axis: entry ``a`` is the
+        eigenvalue of the eigen-direction most aligned with axis ``a``.
+    aligned_basis_t, aligned_basis_R:
+        The matching eigenvectors as columns, permuted and sign-flipped so that
+        column ``a`` is the mode assigned to axis ``a`` and its ``a``-th entry
+        is non-negative.
+    contribution_t, contribution_R:
+        ``aligned_basis ** 2`` elementwise.  Column ``a`` decomposes mode ``a``
+        into its physical-axis content and sums to 1; a column with a dominant
+        entry means the mode *is* that axis, a spread-out column means the mode
+        is a mixture and the per-axis label is only nominal.
+    degenerate_mask:
+        ``True`` where the axis is degenerate, in DOF order
+        ``[tx, ty, tz, ωx, ωy, ωz]``.
+    clamped_lambda_t, clamped_lambda_R:
+        ``aligned_lambda`` with the flagged axes raised to
+        ``lambda_max_of_block / kappa_target``; unflagged axes are untouched.
+        This is the spectrum a mitigation step (preconditioning / regularized
+        solve) should use in place of the raw one.
+    cond_schur_t, cond_schur_R:
+        ``lambda_max / lambda_min`` of the corresponding Schur complement.
+    cond_full:
+        ``lambda_max / lambda_min`` of the full 6×6 ``H``.  Diagnostic only —
+        it mixes translational and rotational units and is exactly the quantity
+        the decoupled analysis exists to avoid trusting.
+    factorization_ok:
+        ``False`` if ``H_tt`` or ``H_ww`` was too ill-conditioned to invert, in
+        which case no Schur complement exists, every axis is reported
+        degenerate, and the Schur/eigen fields are zero-filled.
+    is_degenerate:
+        ``any(degenerate_mask)``.
+    num_constrained_dof:
+        ``6 - sum(degenerate_mask)``.
+    """
+    S_t: np.ndarray                 # (3,3)
+    S_R: np.ndarray                 # (3,3)
+    eigenvalues_t: np.ndarray       # (3,) ascending, raw
+    eigenvalues_R: np.ndarray       # (3,) ascending, raw
+    eigenvectors_t: np.ndarray      # (3,3) columns, raw
+    eigenvectors_R: np.ndarray      # (3,3) columns, raw
+    aligned_lambda_t: np.ndarray    # (3,) per axis [x, y, z]
+    aligned_lambda_R: np.ndarray    # (3,) per axis [ωx, ωy, ωz]
+    aligned_basis_t: np.ndarray     # (3,3) signed-permuted columns
+    aligned_basis_R: np.ndarray     # (3,3)
+    contribution_t: np.ndarray      # (3,3) aligned_basis_t ** 2
+    contribution_R: np.ndarray      # (3,3)
+    degenerate_mask: np.ndarray     # (6,) bool, DOF order
+    clamped_lambda_t: np.ndarray    # (3,)
+    clamped_lambda_R: np.ndarray    # (3,)
+    cond_schur_t: float
+    cond_schur_R: float
+    cond_full: float                # diagnostic only
+    factorization_ok: bool
+    is_degenerate: bool
+    num_constrained_dof: int
+
+
+def _block_is_invertible(block: np.ndarray) -> bool:
+    """
+    True when ``block`` can be inverted well enough to form a Schur complement.
+
+    Uses singular values rather than ``np.linalg.cond`` so that an exactly zero
+    block yields a clean ``False`` instead of a 0/0 RuntimeWarning.
+    """
+    try:
+        s = np.linalg.svd(block, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return False
+    if not np.all(np.isfinite(s)):
+        return False
+    if s[-1] <= 0.0:
+        return False
+    return bool(s[0] / s[-1] <= _SINGULAR_BLOCK_COND)
+
+
+def _align_to_axes(
+    eigenvalues: np.ndarray,
+    eigenvectors: np.ndarray,
+) -> tuple:
+    """
+    Relabel an eigendecomposition per physical axis (greedy signed permutation).
+
+    For axis ``a`` in order 0, 1, 2: among the eigenvector columns not yet
+    claimed, take the one with the largest ``|V[a, col]|`` — the mode that
+    points most along axis ``a`` — and flip its sign so ``V[a, col] >= 0``.
+
+    This is a *relabelling for reporting only*.  Permuting eigenpairs (and
+    flipping eigenvector signs) leaves every spectral reconstruction
+    ``V f(Λ) Vᵀ = Σ_i f(λ_i) v_i v_iᵀ`` unchanged, because the sum is over the
+    same set of (eigenvalue, rank-1 projector) pairs and ``(-v)(-v)ᵀ = v vᵀ``.
+    So a caller may build a preconditioner or a covariance from the aligned
+    quantities and get bit-comparable results to the raw ones.
+
+    Returns ``(aligned_lambda, aligned_basis)``.
+    """
+    n = eigenvectors.shape[0]
+    used = np.zeros(n, dtype=bool)
+    aligned_lambda = np.empty(n, dtype=float)
+    aligned_basis = np.empty((n, n), dtype=float)
+
+    for axis in range(n):
+        candidates = np.flatnonzero(~used)
+        chosen = int(candidates[int(np.argmax(np.abs(eigenvectors[axis, candidates])))])
+        used[chosen] = True
+        column = eigenvectors[:, chosen]
+        if column[axis] < 0.0:
+            column = -column
+        aligned_basis[:, axis] = column
+        aligned_lambda[axis] = eigenvalues[chosen]
+
+    return aligned_lambda, aligned_basis
+
+
+def _ratio(lam_max: float, lam_min: float) -> float:
+    """``lam_max / max(lam_min, floor)``; ``inf`` for a numerically dead block."""
+    if lam_max <= _LAMBDA_FLOOR:
+        return float('inf')
+    return float(lam_max / max(lam_min, _LAMBDA_FLOOR))
+
+
+def analyse_hessian_decoupled(
+    H: np.ndarray,
+    kappa_threshold: float = 10.0,
+    kappa_target: Optional[float] = None,
+) -> DecoupledDegeneracyResult:
+    """
+    Decoupled (Schur-complement) degeneracy analysis of a 6×6 registration
+    Hessian, reporting degeneracy *per physical axis* per block.
+
+    Implements the detection and characterization mathematics of
+
+        Hu et al., "DCReg: Decoupled Characterization for Efficient Degenerate
+        LiDAR Registration", IJRR 2026, arXiv:2509.06285.
+
+    ``H`` must be in this library's DOF order ``[tx, ty, tz, ωx, ωy, ωz]``; the
+    translation and rotation blocks are read off directly, no permutation.
+
+    Why the Schur complement, and not ``eigh(H)``
+    ---------------------------------------------
+    Two separate problems with eigendecomposing the full 6×6 matrix:
+
+    1. **Scale disparity.**  The rotation columns of the Jacobian are lever-arm
+       terms ``n × (R p)``, so rotational curvature carries an extra length²
+       factor relative to translational curvature.  The six eigenvalues of ``H``
+       therefore do not live in the same units, and their spread is dominated by
+       the point-cloud extent rather than by observability.  With a cloud tens
+       of metres across, a *badly* observed rotation axis can still out-scale a
+       *well* observed translation axis, and a single 6×6 ratio test silently
+       hides it.  Testing each block against its own maximum removes the common
+       factor.
+
+    2. **Coupling.**  ``H_tt`` alone is the curvature of translation *with the
+       rotation held fixed*, which flatters it: it ignores that some of that
+       curvature is shared with rotation and cannot be attributed to
+       translation.  The Schur complement
+       ``S_t = H_tt - H_tw inv(H_ww) H_wt`` is the curvature that survives after
+       rotation has been optimally eliminated, and for positive definite ``H``
+       it satisfies ``S_t ⪯ H_tt`` — coupling can only *reduce* observability,
+       never add to it.  A direction that looks well constrained in ``H_tt`` and
+       collapses in ``S_t`` is one whose apparent observability was really the
+       rotation's.
+
+    Criterion
+    ---------
+    Axis ``a`` of block ``B`` is degenerate when
+
+        lambda_max(B) / lambda_a(B) > kappa_threshold
+
+    i.e. an eigenvalue *ratio* against a ratio threshold.  Both sides are
+    unitless, so multiplying ``H`` by any positive constant leaves the mask
+    exactly unchanged.  Contrast :func:`analyse_hessian`, which compares an
+    eigenvalue against ``sqrt(lambda_max / lambda_min)`` and therefore does
+    depend on the absolute magnitude of ``H`` (see its docstring: ``0.5*I`` is
+    called fully degenerate while ``2*I`` is called fully constrained, though
+    both are perfectly conditioned).  Scale invariance matters here because the
+    magnitude of ``H`` tracks correspondence count and residual weighting, which
+    are properties of the run, not of the geometry.
+
+    The two blocks are tested independently: the translation mask never depends
+    on the rotation spectrum, which is the whole point of decoupling.
+
+    Frame
+    -----
+    The ``x/y/z`` and ``roll/pitch/yaw`` labels are meaningful only in the frame
+    whose Jacobian produced ``H`` — for the registration classes in this package
+    that is the source-cloud (body) frame, since ``calc_H_g_e2()`` differentiates
+    with respect to a body-frame perturbation.  "z is degenerate" therefore means
+    the sensor's z, not the world's.  Callers reporting axes to a user in another
+    frame must rotate ``aligned_basis`` themselves; the per-axis labelling is not
+    frame agnostic.
+
+    Args:
+        H: 6×6 approximate Hessian (JᵀJ) in DOF order [tx, ty, tz, ωx, ωy, ωz].
+           Symmetrized on entry.
+        kappa_threshold: Per-block eigenvalue-ratio threshold above which an
+           axis is called degenerate.  Must be positive.
+        kappa_target: Target ratio used when clamping the flagged eigenvalues.
+           Defaults to ``kappa_threshold``, which makes clamping the smallest
+           raise that brings the flagged axis just inside the threshold.  Must be
+           positive.  A value below ``kappa_threshold`` clamps harder (raises
+           more); a value above it leaves the flagged axis still outside the
+           threshold and is only useful if the caller wants a gentler nudge.
+
+    Returns:
+        :class:`DecoupledDegeneracyResult`.
+
+    Notes:
+        If ``H_tt`` or ``H_ww`` is singular (condition number > 1e12) no Schur
+        complement exists; the result carries ``factorization_ok=False``, every
+        axis flagged, zero-filled spectra and zero clamped eigenvalues.  No
+        exception is raised — an under-constrained frame is an expected input,
+        not a programming error.
+
+    Raises:
+        ValueError: if ``kappa_threshold`` or ``kappa_target`` is not positive.
+    """
+    H = np.asarray(H, dtype=float)
+    assert H.shape == (6, 6), f"Expected 6×6 Hessian, got {H.shape}"
+
+    if not kappa_threshold > 0.0:
+        raise ValueError(f"kappa_threshold must be positive, got {kappa_threshold}")
+    if kappa_target is None:
+        kappa_target = kappa_threshold
+    if not kappa_target > 0.0:
+        raise ValueError(f"kappa_target must be positive, got {kappa_target}")
+
+    # 1. Symmetrize and split into blocks (PCR order: translation first).
+    H = 0.5 * (H + H.T)
+    H_tt = H[:3, :3]
+    H_tw = H[:3, 3:]
+    H_wt = H[3:, :3]
+    H_ww = H[3:, 3:]
+
+    # 2. Full-matrix condition number — diagnostic only, see docstring.
+    lam_full = np.linalg.eigvalsh(H)
+    cond_full = _ratio(float(lam_full[-1]), float(lam_full[0]))
+
+    # 3. Invertibility gate.  Without both diagonal blocks invertible there is
+    #    no Schur complement to analyse.
+    if not (_block_is_invertible(H_tt) and _block_is_invertible(H_ww)):
+        zeros3 = np.zeros(3)
+        zeros33 = np.zeros((3, 3))
+        return DecoupledDegeneracyResult(
+            S_t=zeros33.copy(),
+            S_R=zeros33.copy(),
+            eigenvalues_t=zeros3.copy(),
+            eigenvalues_R=zeros3.copy(),
+            eigenvectors_t=zeros33.copy(),
+            eigenvectors_R=zeros33.copy(),
+            aligned_lambda_t=zeros3.copy(),
+            aligned_lambda_R=zeros3.copy(),
+            aligned_basis_t=zeros33.copy(),
+            aligned_basis_R=zeros33.copy(),
+            contribution_t=zeros33.copy(),
+            contribution_R=zeros33.copy(),
+            degenerate_mask=np.ones(6, dtype=bool),
+            clamped_lambda_t=zeros3.copy(),
+            clamped_lambda_R=zeros3.copy(),
+            cond_schur_t=float('inf'),
+            cond_schur_R=float('inf'),
+            cond_full=cond_full,
+            factorization_ok=False,
+            is_degenerate=True,
+            num_constrained_dof=0,
+        )
+
+    # 4. Schur complements.  S_t: translation curvature after rotation has been
+    #    optimally eliminated (and vice versa for S_R).
+    S_t = H_tt - H_tw @ np.linalg.inv(H_ww) @ H_wt
+    S_R = H_ww - H_wt @ np.linalg.inv(H_tt) @ H_tw
+    S_t = 0.5 * (S_t + S_t.T)
+    S_R = 0.5 * (S_R + S_R.T)
+
+    # 5. Spectra (ascending).
+    lam_t, V_t = np.linalg.eigh(S_t)
+    lam_R, V_R = np.linalg.eigh(S_R)
+
+    # 6. Per-axis relabelling.
+    aligned_lambda_t, aligned_basis_t = _align_to_axes(lam_t, V_t)
+    aligned_lambda_R, aligned_basis_R = _align_to_axes(lam_R, V_R)
+
+    # 7. Per-axis, within-block degeneracy test (ratio vs ratio).
+    lam_t_max = float(lam_t[-1])
+    lam_R_max = float(lam_R[-1])
+    mask_t = (lam_t_max / np.maximum(aligned_lambda_t, _LAMBDA_FLOOR)) > kappa_threshold
+    mask_R = (lam_R_max / np.maximum(aligned_lambda_R, _LAMBDA_FLOOR)) > kappa_threshold
+    degenerate_mask = np.concatenate([mask_t, mask_R])
+
+    # 8. Clamping: raise the flagged axes to the target ratio, leave the rest.
+    clamped_lambda_t = aligned_lambda_t.copy()
+    clamped_lambda_R = aligned_lambda_R.copy()
+    clamped_lambda_t[mask_t] = max(lam_t_max / kappa_target, _CLAMP_FLOOR)
+    clamped_lambda_R[mask_R] = max(lam_R_max / kappa_target, _CLAMP_FLOOR)
+
+    return DecoupledDegeneracyResult(
+        S_t=S_t,
+        S_R=S_R,
+        eigenvalues_t=lam_t,
+        eigenvalues_R=lam_R,
+        eigenvectors_t=V_t,
+        eigenvectors_R=V_R,
+        aligned_lambda_t=aligned_lambda_t,
+        aligned_lambda_R=aligned_lambda_R,
+        aligned_basis_t=aligned_basis_t,
+        aligned_basis_R=aligned_basis_R,
+        contribution_t=aligned_basis_t ** 2,
+        contribution_R=aligned_basis_R ** 2,
+        degenerate_mask=degenerate_mask,
+        clamped_lambda_t=clamped_lambda_t,
+        clamped_lambda_R=clamped_lambda_R,
+        cond_schur_t=_ratio(lam_t_max, float(lam_t[0])),
+        cond_schur_R=_ratio(lam_R_max, float(lam_R[0])),
+        cond_full=cond_full,
+        factorization_ok=True,
+        is_degenerate=bool(np.any(degenerate_mask)),
+        num_constrained_dof=int(6 - np.count_nonzero(degenerate_mask)),
+    )
