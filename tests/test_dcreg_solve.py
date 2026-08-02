@@ -24,12 +24,19 @@ to keep that distinction visible:
 * ``mode='clamped'`` genuinely changes the minimum.  It adds the PSD spectral
   deficit ``A diag(clamped - aligned) A^T`` to the flagged aligned directions
   and to nothing else.  Test 2 pins that targeting property.
+
+Section 7 covers a third, hybrid entry point that lives in the same module:
+:func:`apply_sr_solve_decoupled`, which keeps this analysis as its *detector*
+but swaps the mitigation for solution-remapping-style zeroing.  It is not a
+mode of ``dcreg_solve`` and is tested separately, because what it does to the
+step is categorically different: exact projection rather than reweighting.
 """
 import numpy as np
 import pytest
 
 from point_cloud_registration.degeneracy import (
     analyse_hessian_decoupled,
+    apply_sr_solve_decoupled,
     dcreg_solve,
     _dcreg_preconditioner,
 )
@@ -684,6 +691,238 @@ class TestModeValidation:
 
 
 # --------------------------------------------------------------------------
+# 7 - apply_sr_solve_decoupled: decoupled detection + solution-remapping zeroing
+# --------------------------------------------------------------------------
+
+class TestApplySRSolveDecoupled:
+    """
+    The hybrid mitigation: the *detector* of ``analyse_hessian_decoupled``
+    (per-block Schur complements, scale-invariant per-axis ratio test) paired
+    with the *mitigation* of :func:`apply_sr_solve` (zero the step along every
+    flagged direction, take the full Gauss-Newton step along the rest).
+
+    What distinguishes it from the two neighbours already tested in this file:
+
+    * against ``mode='clamped'`` — clamping *raises curvature* along a flagged
+      axis, which shortens the step there but does not null it, and the
+      regularized system is still coupled so the correction leaks onto the
+      unflagged axes (see :class:`TestClampedIsTargeted`).  Zeroing is exact
+      and leaks nothing: the unflagged coefficients are bit-for-bit the plain
+      Gauss-Newton ones.
+    * against :func:`apply_sr_solve` — same zeroing, different basis.  The
+      directions being zeroed are the per-block Schur eigenvectors selected by
+      a ratio-vs-ratio test, not the full-6x6 eigenvectors selected by the
+      magnitude-sensitive ``lambda_cn`` test.
+    """
+
+    @staticmethod
+    def _projector(deg) -> np.ndarray:
+        """
+        Recover the 6x6 projector the function applies, using only its public
+        behaviour.
+
+        With ``H = I`` the internal solve is the identity map, so
+        ``apply_sr_solve_decoupled(I, -e_j, deg) = P e_j`` — column ``j`` of
+        the projector.  ``deg`` is deliberately *not* the analysis of ``I``:
+        the contract says ``deg`` may come from a different (raw) Hessian than
+        the one being solved, which is exactly what makes this probe legal.
+        """
+        columns = []
+        for j in range(6):
+            e_j = np.zeros(6)
+            e_j[j] = 1.0
+            columns.append(apply_sr_solve_decoupled(np.eye(6), -e_j, deg))
+        return np.column_stack(columns)
+
+    def test_no_flagged_axis_reduces_to_the_standard_solve(self):
+        """Nothing flagged => the projector is the identity => plain GN step."""
+        H = _well_conditioned_h()
+        g = _seeded_g()
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+        assert deg.factorization_ok
+        assert not deg.is_degenerate, "fixture should have nothing flagged"
+
+        dx = apply_sr_solve_decoupled(H, g, deg)
+
+        np.testing.assert_allclose(dx, np.linalg.solve(H, -g), atol=1e-10)
+
+    def test_flagged_directions_are_exactly_zeroed(self):
+        """
+        On the golden fixture (tz and yaw flagged) the step has no component
+        along either flagged aligned direction, while the unflagged components
+        are untouched — the full Gauss-Newton coefficient, not a shortened one.
+        """
+        H = _golden_h_pcr()
+        g = _seeded_g()
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0, kappa_target=10.0)
+        assert deg.degenerate_mask[2] and deg.degenerate_mask[5], "tz and yaw flagged"
+
+        dx = apply_sr_solve_decoupled(H, g, deg)
+
+        proj = _project_on_aligned_axes(deg, dx)
+        proj_gn = _project_on_aligned_axes(deg, _gn_step(H, g))
+        mask = deg.degenerate_mask
+
+        assert np.abs(proj[mask]).max() < 1e-12, (
+            f"flagged directions not zeroed: {proj[mask]}"
+        )
+        np.testing.assert_allclose(proj[~mask], proj_gn[~mask], atol=1e-10)
+        # The suppression is real, not vacuous: GN wanted 14.6 along tz.
+        assert abs(proj_gn[2]) > 1.0
+
+    def test_step_is_the_projector_applied_to_the_gauss_newton_step(self):
+        """``dx = P dx_gn`` exactly — zeroing acts on the step, not on H."""
+        H = _golden_h_pcr()
+        g = _seeded_g()
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+
+        dx = apply_sr_solve_decoupled(H, g, deg)
+        P = self._projector(deg)
+
+        np.testing.assert_allclose(dx, P @ np.linalg.solve(H, -g), atol=1e-12)
+
+    def test_projector_is_symmetric_and_idempotent(self):
+        """
+        ``P = Vf_inv @ Vu`` is the orthogonal projection onto the span of the
+        unflagged Schur eigen-directions, so ``P = P^T`` and ``P @ P = P``.
+        """
+        H = _golden_h_pcr()
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+        P = self._projector(deg)
+
+        np.testing.assert_allclose(P, P.T, atol=1e-12)
+        np.testing.assert_allclose(P @ P, P, atol=1e-12)
+        # Rank = number of unflagged axes (4 here: tz and yaw are flagged).
+        assert np.linalg.matrix_rank(P, tol=1e-9) == deg.num_constrained_dof
+
+    def test_projector_matches_a_blockwise_build_from_the_raw_eigenvectors(self):
+        """
+        Implementation-independence check, in the style of
+        ``test_degeneracy_decoupled.py::TestAlignmentInvariance``.
+
+        Rebuild ``P`` as ``blkdiag(P_t, P_R)`` from the *raw* (unpermuted,
+        unflipped) Schur eigenvectors with the mask permuted back into raw
+        order.  The greedy alignment is a relabelling, so a projector assembled
+        either way must be the same matrix — and in particular the block
+        structure must be exact, with no translation/rotation coupling.
+        """
+        H = _golden_h_pcr()
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+        P = self._projector(deg)
+
+        expected = np.zeros((6, 6))
+        for slot, V, aligned_basis, mask in (
+            (slice(0, 3), deg.eigenvectors_t, deg.aligned_basis_t,
+             deg.degenerate_mask[:3]),
+            (slice(3, 6), deg.eigenvectors_R, deg.aligned_basis_R,
+             deg.degenerate_mask[3:]),
+        ):
+            # aligned column a is +/- raw column perm[a]; recover perm.
+            overlap = np.abs(aligned_basis.T @ V)
+            perm = np.argmax(overlap, axis=1)
+            assert sorted(perm.tolist()) == [0, 1, 2], "alignment is not a permutation"
+
+            mask_raw = np.empty(3, dtype=bool)
+            mask_raw[perm] = mask
+            keep = (~mask_raw).astype(float)
+            expected[slot, slot] = V @ np.diag(keep) @ V.T
+
+        np.testing.assert_allclose(P, expected, atol=1e-12)
+        np.testing.assert_array_equal(P[:3, 3:] != 0.0, np.zeros((3, 3), dtype=bool))
+        np.testing.assert_array_equal(P[3:, :3] != 0.0, np.zeros((3, 3), dtype=bool))
+
+    def test_failed_factorization_gives_the_exact_zero_step(self):
+        """
+        No Schur complement => every axis flagged => the projector is the zero
+        matrix => the step is exactly zero and the initial guess is preserved.
+
+        Note the consequence for a caller: an ICP iteration in this state makes
+        no progress at all (and, because the step norm is 0, converges on the
+        spot).  That is the honest reading of "the data constrains nothing" —
+        contrast ``dcreg_solve``, which falls back to a minimum-norm ``lstsq``
+        step here.
+        """
+        H = np.diag([5.0, 5.0, 5.0, 0.0, 0.0, 0.0])
+        g = np.array([1.0, -2.0, 0.5, 0.0, 0.0, 0.0])
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+        assert deg.factorization_ok is False
+        assert deg.degenerate_mask.all()
+
+        dx = apply_sr_solve_decoupled(H, g, deg)
+
+        np.testing.assert_array_equal(dx, np.zeros(6))
+
+    def test_analyse_raw_solve_damped(self):
+        """
+        The composition contract, mirroring the one ``apply_sr_solve`` and
+        ``dcreg_solve`` document: ``deg`` is taken from the RAW Hessian while
+        the Hessian handed to the solve may be the LM-damped one.
+
+        The teeth: on the golden fixture a damping of lambda = 3.0 lifts the
+        weak eigenvalues enough that the ratio test flags *nothing*.  Analysing
+        the damped matrix would therefore disable the mitigation entirely,
+        while analysing the raw one keeps tz and yaw zeroed even though the
+        solve runs on H + lambda*I.
+        """
+        H = _golden_h_pcr()
+        g = _seeded_g()
+        lam = 3.0
+        H_damped = H + lam * np.eye(6)
+
+        deg_raw = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+        deg_damped = analyse_hessian_decoupled(H_damped, kappa_threshold=10.0)
+
+        assert deg_raw.degenerate_mask[2] and deg_raw.degenerate_mask[5]
+        assert not deg_damped.is_degenerate, (
+            "premise: this much damping hides the degeneracy from the detector"
+        )
+
+        dx = apply_sr_solve_decoupled(H_damped, g, deg_raw)
+        proj = _project_on_aligned_axes(deg_raw, dx)
+
+        assert np.abs(proj[deg_raw.degenerate_mask]).max() < 1e-12, (
+            "the raw-H mask was not applied to the damped solve"
+        )
+        # Analysing the damped H instead would have zeroed nothing.
+        dx_wrong = apply_sr_solve_decoupled(H_damped, g, deg_damped)
+        np.testing.assert_allclose(
+            dx_wrong, np.linalg.solve(H_damped, -g), atol=1e-10
+        )
+        assert not np.allclose(dx, dx_wrong, atol=1e-6)
+
+    def test_singular_hessian_raises_like_apply_sr_solve(self):
+        """
+        Same contract boundary as ``apply_sr_solve``: the projection does not
+        remove the inversion, so an exactly singular H raises even though the
+        analysis classified it happily.  The remedy is lm_damping, not a
+        different mask.
+
+        The fixture is singular in the *coupling*, not in a diagonal block:
+        with ``H_tt = I`` and ``H_tw = I`` the rotation Schur complement is
+        ``diag(0, 1, 100)``, so both blocks invert (``factorization_ok`` is
+        True, unlike the flat-plane case), three axes are flagged, and
+        ``det(H) = det(H_tt) det(S_R) = 0``.
+        """
+        H = np.block([
+            [np.eye(3), np.eye(3)],
+            [np.eye(3), np.diag([1.0, 2.0, 101.0])],
+        ])
+
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+        assert deg.factorization_ok, "fixture: the blocks must still invert"
+        assert deg.is_degenerate, "fixture: the zero direction must be flagged"
+
+        with pytest.raises(np.linalg.LinAlgError):
+            apply_sr_solve_decoupled(H, _seeded_g(), deg)
+
+    def test_zero_gradient_gives_zero_step(self):
+        H = _golden_h_pcr()
+        deg = analyse_hessian_decoupled(H, kappa_threshold=10.0)
+        dx = apply_sr_solve_decoupled(H, np.zeros(6), deg)
+        np.testing.assert_allclose(dx, np.zeros(6), atol=1e-15)
+
+
+# --------------------------------------------------------------------------
 # Package export
 # --------------------------------------------------------------------------
 
@@ -691,3 +930,4 @@ def test_exported_from_package_root():
     import point_cloud_registration as pcr
 
     assert hasattr(pcr, "dcreg_solve")
+    assert hasattr(pcr, "apply_sr_solve_decoupled")

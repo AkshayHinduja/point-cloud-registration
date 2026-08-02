@@ -106,6 +106,37 @@ class TestParameterValidation:
         with pytest.raises(ValueError, match="dcreg_mode"):
             engine.align(source, dcreg_mode='foo')
 
+    def test_sr_mode_is_accepted(self, well_conditioned_pair):
+        """The hybrid mode is a legal dcreg_mode value, not a typo."""
+        target, source, _ = well_conditioned_pair
+        T = _engine(target).align(source, dcreg_mode='sr')
+        assert T.shape == (4, 4)
+        assert np.all(np.isfinite(T))
+
+    def test_near_miss_of_sr_is_rejected_and_lists_the_valid_values(self):
+        """A typo must not fall through to a silently different strategy."""
+        target, source, _ = build_well_conditioned_pair()
+        engine = _engine(target)
+        with pytest.raises(ValueError) as excinfo:
+            engine.align(source, dcreg_mode='srr')
+        message = str(excinfo.value)
+        assert "'srr'" in message
+        for valid in ("'pcg'", "'clamped'", "'sr'"):
+            assert valid in message, f"{valid} missing from {message!r}"
+
+    def test_sr_mode_and_solution_remapping_are_mutually_exclusive(
+        self, well_conditioned_pair
+    ):
+        """
+        'sr' borrows solution remapping's *mitigation*, so stacking it with the
+        original SR path is doubly meaningless — two projectors built from two
+        different detectors.  Rejected like the other modes.
+        """
+        target, source, _ = well_conditioned_pair
+        engine = _engine(target)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            engine.align(source, dcreg_mode='sr', use_solution_remapping=True)
+
     def test_validation_happens_before_any_iteration(self, well_conditioned_pair):
         """A rejected configuration must not leave a half-updated Hessian behind."""
         target, source, _ = well_conditioned_pair
@@ -291,6 +322,183 @@ class TestNearDegenerate:
 
         assert np.max(np.abs(T_default - T_clamped)) > 0.1, (
             "clamped should differ substantially from Gauss-Newton here"
+        )
+
+
+class TestSrMode:
+    """
+    ``dcreg_mode='sr'`` — decoupled detection, solution-remapping mitigation.
+
+    The unit-level behaviour of the projector lives in
+    ``tests/test_dcreg_solve.py``; what is checked here is that the loop runs
+    and that the mode does at the ICP level what the projector says it does.
+    """
+
+    def test_well_conditioned_matches_the_damped_default_solve(
+        self, well_conditioned_pair
+    ):
+        """
+        Nothing flagged => the projector is the identity => 'sr' *is* the
+        damped Gauss-Newton solve.  Measured max difference: 2.8e-17.
+
+        The comparison is against ``lm_damping=True`` rather than the plain
+        solver because 'sr' is exercised with damping on (the projection does
+        not remove the inversion), and damping is what the two must share.
+        """
+        target, source, _ = well_conditioned_pair
+
+        T_damped = _engine(target).align(source, lm_damping=True)
+        T_sr = _engine(target).align(source, dcreg_mode='sr', lm_damping=True)
+
+        assert np.all(np.isfinite(T_sr))
+        assert np.allclose(T_damped, T_sr, atol=1e-3), (
+            f"sr diverged from the damped default; max diff "
+            f"{np.max(np.abs(T_damped - T_sr))}"
+        )
+
+    def test_near_degenerate_runs_and_suppresses_the_flagged_axes(
+        self, near_degenerate_pair
+    ):
+        """
+        The fixture where the hybrid actually executes: the blocks factorize,
+        and tx / ty / wz are flagged by the ratio test.
+
+        Zeroing declines the lateral correction exactly as 'clamped' does —
+        the detector is what changed, not the trade.  Measured: x = -7.1e-4,
+        y = -1.2e-3, z = -0.5025, against a plain Gauss-Newton run that
+        recovers the full (-0.6, -0.2, -0.5).  Recorded so the cost of the
+        mode is visible next to its benefit, as for 'clamped' above.
+        """
+        target, source = near_degenerate_pair
+
+        T_default = _engine(target).align(source)
+        T_sr = _engine(target).align(source, dcreg_mode='sr', lm_damping=True)
+
+        assert np.all(np.isfinite(T_sr))
+        np.testing.assert_allclose(T_default[:3, 3], [-0.6, -0.2, -0.5], atol=1e-4)
+
+        assert abs(T_sr[0, 3]) < 0.01, f"x = {T_sr[0, 3]}"
+        assert abs(T_sr[1, 3]) < 0.01, f"y = {T_sr[1, 3]}"
+        assert abs(_yaw(T_sr)) < 0.01, f"yaw = {_yaw(T_sr)}"
+        # z is unflagged, so it is corrected normally.
+        assert T_sr[2, 3] == pytest.approx(-0.5, abs=1e-2)
+
+    def test_flat_plane_takes_the_zero_step(self, degenerate_pair):
+        """
+        HONEST RESULT, and the one place 'sr' differs sharply from the other
+        two modes.  The flat plane has no Schur complement
+        (``factorization_ok=False``), so every axis is flagged, the projector
+        is the zero matrix and the step is exactly zero — align() converges
+        immediately and returns the initial guess.
+
+        'pcg' and 'clamped' fall back to ``lstsq`` here and do converge z onto
+        the plane; 'sr' does not.  Finite and safe, but it makes no progress
+        at all on rank-deficient geometry.
+        """
+        target, source = degenerate_pair
+
+        T = _engine(target).align(source, dcreg_mode='sr', lm_damping=True)
+
+        assert np.all(np.isfinite(T))
+        np.testing.assert_array_equal(T, np.eye(4))
+
+    def test_sr_ignores_the_clamping_and_pcg_parameters(self, near_degenerate_pair):
+        """
+        kappa_target and the two PCG parameters are inert for this mode — they
+        are accepted rather than rejected (so a caller can sweep modes with one
+        parameter dict) but they must not change the result.
+        """
+        target, source = near_degenerate_pair
+
+        T_plain = _engine(target).align(source, dcreg_mode='sr', lm_damping=True)
+        T_noisy = _engine(target).align(
+            source, dcreg_mode='sr', lm_damping=True,
+            dcreg_kappa_target=1e4,
+            dcreg_pcg_tolerance=1e-1,
+            dcreg_pcg_max_iterations=1,
+        )
+
+        np.testing.assert_array_equal(T_plain, T_noisy)
+
+    @pytest.mark.parametrize("bad_kappa_target", [0.0, -1.0, float('nan')])
+    def test_sr_accepts_a_kappa_target_the_analyser_would_reject(
+        self, near_degenerate_pair, bad_kappa_target
+    ):
+        """
+        "Inert" has to mean inert for values the *other* modes reject, not just
+        for well-formed ones — otherwise the parameter is only nominally
+        ignored.
+
+        analyse_hessian_decoupled raises ValueError on a non-positive or NaN
+        kappa_target.  'sr' consumes only the mask and the aligned bases, and
+        neither depends on kappa_target (clamping is the sole consumer), so the
+        align() dispatch must not forward it for this mode.  A caller sweeping
+        modes with one parameter dict would otherwise hit a validation error
+        raised on behalf of a computation that never runs.
+
+        The result must additionally be bit-identical to omitting the parameter
+        entirely, which is what rules out the value quietly leaking into the
+        detection through some other route.
+        """
+        target, source = near_degenerate_pair
+
+        T_omitted = _engine(target).align(source, dcreg_mode='sr', lm_damping=True)
+        T_bad = _engine(target).align(
+            source, dcreg_mode='sr', lm_damping=True,
+            dcreg_kappa_target=bad_kappa_target,
+        )
+
+        np.testing.assert_array_equal(T_omitted, T_bad)
+
+    @pytest.mark.parametrize("bad_kappa_target", [0.0, -1.0, float('nan')])
+    def test_clamped_still_rejects_the_same_kappa_target(
+        self, near_degenerate_pair, bad_kappa_target
+    ):
+        """
+        The other half of the contract: the validation path is untouched for the
+        modes that DO consume kappa_target.  'clamped' must still surface
+        analyse_hessian_decoupled's ValueError rather than silently substituting
+        a default — the exemption is specific to 'sr', not a global loosening.
+        """
+        target, source = near_degenerate_pair
+        engine = _engine(target)
+
+        with pytest.raises(ValueError, match="kappa_target"):
+            engine.align(
+                source, dcreg_mode='clamped', lm_damping=True,
+                dcreg_kappa_target=bad_kappa_target,
+            )
+
+    def test_kappa_threshold_still_drives_detection(self, near_degenerate_pair):
+        """
+        The one parameter that does matter.  A threshold loose enough to flag
+        nothing turns the mode back into the damped plain solve — bit-for-bit,
+        because an empty mask makes the projector the identity — and the
+        lateral correction that the default threshold suppressed reappears.
+
+        Honest note on the size of it: the damped solver only recovers x to
+        -0.128 on this fixture (the LM shift, not the projection, is what
+        limits it there; plain undamped Gauss-Newton reaches -0.600).  The
+        comparison that means something is therefore against
+        ``lm_damping=True``, with the ~180x growth in the recovered x as the
+        behavioural evidence that the threshold changed the mask.
+        """
+        target, source = near_degenerate_pair
+
+        engine = _engine(target)
+        H = engine.calc_H_g_e2(np.eye(4), source.astype(np.float32))[0]
+        deg = analyse_hessian_decoupled(H.astype(float), kappa_threshold=1e9)
+        assert not deg.is_degenerate, "premise: a huge threshold flags nothing"
+
+        T_damped = _engine(target).align(source, lm_damping=True)
+        T_loose = _engine(target).align(
+            source, dcreg_mode='sr', lm_damping=True, dcreg_kappa_threshold=1e9
+        )
+        T_default = _engine(target).align(source, dcreg_mode='sr', lm_damping=True)
+
+        np.testing.assert_allclose(T_loose, T_damped, rtol=0, atol=1e-12)
+        assert abs(T_loose[0, 3]) > 50.0 * abs(T_default[0, 3]), (
+            f"loose x {T_loose[0, 3]} vs default x {T_default[0, 3]}"
         )
 
 

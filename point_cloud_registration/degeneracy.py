@@ -36,6 +36,12 @@ and does move the minimum.  Read that function's docstring before picking one;
 the difference between them is the difference between a numerical convenience
 and a change of estimate.
 
+:func:`apply_sr_solve_decoupled` is the hybrid of the two families: the
+decoupled detector above paired with solution remapping's mitigation, i.e. the
+step is *zeroed* along every flagged axis instead of being reweighted, but the
+axes are chosen by the scale-invariant per-block ratio test rather than by
+``lambda_cn``.
+
 References:
     A. Hinduja, B.-J. Ho and M. Kaess, "Degeneracy-Aware Factors with
     Applications to Underwater SLAM", IEEE/RSJ International Conference on
@@ -1021,3 +1027,122 @@ def dcreg_solve(
     info['pcg_converged'] = True
     info['relative_residual'] = float(np.linalg.norm(r)) / max(1.0, norm_b)
     return x, info
+
+
+def apply_sr_solve_decoupled(
+    H: np.ndarray,
+    g: np.ndarray,
+    deg: DecoupledDegeneracyResult,
+) -> np.ndarray:
+    """
+    Solution remapping applied in the decoupled (Schur) eigenbasis — the
+    detector of :func:`analyse_hessian_decoupled` with the mitigation of
+    :func:`apply_sr_solve`.
+
+    Standard solve:  dx = -H⁻¹ g
+    This solve:      dx = -Vf_inv @ Vu_filtered @ H⁻¹ @ g
+
+    ``V = blkdiag(deg.aligned_basis_t, deg.aligned_basis_R)`` is the 6×6
+    orthonormal basis whose column ``a`` is the per-block Schur eigen-direction
+    assigned to DOF ``a``, so its columns line up one-for-one with
+    ``deg.degenerate_mask`` in PCR order ``[tx, ty, tz, ωx, ωy, ωz]``.
+    ``Vu_filtered`` is ``V.T`` with the flagged rows replaced by zero, and
+    ``Vf_inv = inv(V.T)`` maps back from the eigenbasis to the DOF basis.  The
+    composition projects the Gauss-Newton step onto the span of the unflagged
+    directions: the full step where the data supports it, no step at all along
+    the axes it does not.
+
+    Difference from :func:`apply_sr_solve`
+    --------------------------------------
+    The zeroing semantics are identical; the *basis being zeroed in* is not.
+    :func:`apply_sr_solve` uses the eigenvectors of the full 6×6 ``H`` selected
+    by the ``lambda_cn`` test, which compares an eigenvalue against a unitless
+    ratio and so depends on the absolute magnitude of ``H`` (see
+    :func:`analyse_hessian`).  Here the directions are the per-block Schur
+    eigenvectors selected by a ratio-vs-ratio test, which is invariant to a
+    uniform rescaling of ``H`` and does not let rotational lever-arm curvature
+    mask a translational degeneracy (see :func:`analyse_hessian_decoupled`).
+    Same mitigation, better-behaved detector.
+
+    Difference from :func:`dcreg_solve`
+    -----------------------------------
+    ``'clamped'`` *raises curvature* along a flagged axis, which shortens the
+    step there without nulling it and — because the regularized system stays
+    coupled — leaks some of that change onto the unflagged axes.  Zeroing is
+    exact: the unflagged coefficients are the plain Gauss-Newton ones and the
+    flagged ones are 0.
+
+    Contract on ``deg``
+    -------------------
+    ``deg`` must come from :func:`analyse_hessian_decoupled` applied to the
+    **raw** Hessian, while the ``H`` passed *here* may be the LM-damped one —
+    the same rule :func:`apply_sr_solve` and :func:`dcreg_solve` document.
+    Analysing a damped ``H + λI`` lifts the small eigenvalues before the ratio
+    test sees them and so under-reports degeneracy; for a large enough λ
+    nothing is flagged at all and the mitigation silently disappears.  Analyse
+    raw, solve damped.
+
+    Contract on ``H``
+    -----------------
+    ``H`` must be invertible.  Detecting degeneracy does not remove the
+    inversion — ``np.linalg.solve(H, g)`` runs on the ``H`` you pass, before any
+    projection, so an exactly singular one raises ``np.linalg.LinAlgError`` no
+    matter what ``deg`` says about it.  The remedy is the same as for
+    :func:`apply_sr_solve`: pass a regularized ``H + lambda*I`` while taking
+    ``deg`` from the raw ``H``.  An isotropic shift leaves the eigenvectors
+    untouched, so the projection is unchanged; only the step length along the
+    unflagged directions is damped.
+
+    Degenerate cases
+    ----------------
+    * ``deg.is_degenerate`` ``False`` ⇒ nothing is zeroed ⇒ this reduces
+      exactly to the standard solve ``-H⁻¹ g``.
+    * ``deg.factorization_ok`` ``False`` ⇒ there are no Schur complements,
+      every axis is flagged, and the projector is the zero matrix ⇒ the
+      returned step is the **exact zero vector** and the caller's initial guess
+      is preserved unchanged.  ``H`` is not inverted in this case, so a
+      singular one does not raise here.  Note the operational consequence: an
+      ICP iteration in this state makes no progress and, with a zero step norm,
+      converges on the spot.  Contrast :func:`dcreg_solve`, which falls back to
+      a minimum-norm ``lstsq`` step on the same input.
+
+    Projector
+    ---------
+    ``P = Vf_inv @ Vu_filtered`` is symmetric and idempotent: it is the
+    orthogonal projection onto the span of the unflagged Schur eigen-directions
+    (``P = Σ_unflagged v_a v_aᵀ``), and it is block diagonal, with no
+    translation/rotation coupling.  ``inv(V.T)`` equals ``V`` for orthonormal
+    ``V``; it is written as an inverse to keep the structure parallel to
+    :func:`apply_sr_solve` rather than to save an operation.
+
+    Args:
+        H:   6×6 Hessian in PCR DOF order, invertible — see Contract on H.
+             Not symmetrized (mirroring :func:`apply_sr_solve`); ``dcreg_solve``
+             does symmetrize, so the two differ on a non-symmetric input.
+        g:   6-element gradient in PCR DOF order.
+        deg: :class:`DecoupledDegeneracyResult` from the **raw** Hessian.
+
+    Returns:
+        6-element step dx in PCR DOF order.
+
+    Raises:
+        numpy.linalg.LinAlgError: if H is singular (and ``factorization_ok``).
+    """
+    # No Schur complements → the aligned bases are zero-filled and every axis is
+    # flagged, so the projector is the zero matrix.  Short-circuit rather than
+    # inverting a zero V.T: the answer is the zero step either way.
+    if not deg.factorization_ok:
+        return np.zeros(6, dtype=float)
+
+    V = np.zeros((6, 6), dtype=float)       # blkdiag of the two aligned bases
+    V[:3, :3] = deg.aligned_basis_t
+    V[3:, 3:] = deg.aligned_basis_R
+
+    Vu = V.T.copy()                         # (6, 6) rows = aligned directions
+    for i in range(6):
+        if deg.degenerate_mask[i]:
+            Vu[i, :] = 0.0                  # zero degenerate rows
+
+    Vf_inv = np.linalg.inv(V.T)
+    H_inv_g = np.linalg.solve(H, g)
+    return -(Vf_inv @ Vu @ H_inv_g)
