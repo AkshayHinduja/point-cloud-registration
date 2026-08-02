@@ -37,9 +37,18 @@ the difference between them is the difference between a numerical convenience
 and a change of estimate.
 
 References:
-    Zhang & Singh, "On Degeneracy of Optimization-based State Estimation
-    Problems", IEEE International Conference on Robotics and Automation
-    (ICRA), 2016 — J. Zhang, M. Kaess and S. Singh.
+    A. Hinduja, B.-J. Ho and M. Kaess, "Degeneracy-Aware Factors with
+    Applications to Underwater SLAM", IEEE/RSJ International Conference on
+    Intelligent Robots and Systems (IROS), 2019, pp. 1293-1299,
+    doi: 10.1109/IROS40897.2019.8968577 — introduced solution remapping
+    inside the ICP iteration itself (its Algorithm 1 is the procedure
+    implemented by :func:`analyse_hessian` + :func:`apply_sr_solve`,
+    including the ``sqrt(lambda_max / lambda_min)`` threshold).
+
+    J. Zhang, M. Kaess and S. Singh, "On Degeneracy of Optimization-based
+    State Estimation Problems", IEEE International Conference on Robotics
+    and Automation (ICRA), 2016 — the origin of the solution-remapping
+    update for optimization-based state estimation.
 
     Hu et al., "DCReg: Decoupled Characterization for Efficient Degenerate
     LiDAR Registration", International Journal of Robotics Research (IJRR),

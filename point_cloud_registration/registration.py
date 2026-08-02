@@ -86,7 +86,9 @@ class Registration:
         :param init_T: Initial transformation (4x4 array).
         :param verbose: Print error at each iteration.
         :param use_solution_remapping: If True, zero the step in degenerate Hessian
-            eigenvector directions at each iteration (SR mode).
+            eigenvector directions at each iteration (SR mode; Hinduja, Ho &
+            Kaess, IROS 2019, Algorithm 1 — solution remapping per Zhang,
+            Kaess & Singh, ICRA 2016; see degeneracy.py for full references).
         :param sr_lambda_threshold: Override the condition-number threshold for SR.
             None = adaptive (sqrt(lambda_max / lambda_min)).
         :param lm_damping: If True, solve the damped system (H + lambda*I) dx = -g
