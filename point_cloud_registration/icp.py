@@ -65,7 +65,9 @@ class ICP(Registration):
         src_trans = transform_points(cur_T, source)
         dist, idx = self.kdtree.query(src_trans.astype(np.float32))
         mask = dist < self.max_dist
+        idx = idx[mask]
         src_trans = src_trans[mask]
+        src_mask = source[mask]
         num = src_trans.shape[0]
         # Find corresponding target points
         qs = self.target[idx]
@@ -78,7 +80,7 @@ class ICP(Registration):
             # Jacobian of the transformation
             J[:, :3] = np.eye(3)
             # Jacobian of the rotation
-            J[:, 3:] = -R @ skew(source[i])
+            J[:, 3:] = -R @ skew(src_mask[i])
             # residual
             r = src_trans[i] - qs[i]
             # Hessian

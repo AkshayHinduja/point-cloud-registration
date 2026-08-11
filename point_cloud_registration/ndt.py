@@ -75,23 +75,21 @@ class NDT(Registration):
         mask = dist < self.max_dist
         means = means[mask]
         icov = icov[mask]
-        #src_mask = source[mask]
+        src_mask = source[mask]
         src_trans = src_trans[mask]
         H = np.zeros((6, 6))
         g = np.zeros(6)
         e2 = 0
 
-        for i in range(source.shape[0]):
+        for i in range(src_mask.shape[0]):
             J = np.zeros((3, 6))
             # Jacobian of the transformation
             J[:, :3] = np.eye(3)
             # Jacobian of the rotation
-            J[:, 3:] = -R @ skew(source[i])
+            J[:, 3:] = -R @ skew(src_mask[i])
             # residual
             r = src_trans[i] - means[i]
 
-            if dist[i] > self.max_dist:
-                continue
             H += J.T @ icov[i] @  J
             g += J.T @ icov[i] @ r
             e2 += r @ icov[i] @ r

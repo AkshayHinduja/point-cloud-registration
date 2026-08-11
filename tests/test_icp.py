@@ -17,11 +17,15 @@ def generate_test_data():
     return target, source
 
 
-def test_calc_H_g_e2(generate_test_data):
+@pytest.mark.parametrize("with_outliers", [False, True], ids=["all_inliers", "with_outliers"])
+def test_calc_H_g_e2(generate_test_data, with_outliers):
     """
     Test that calc_H_g_e2 and calc_H_g_e2_no_parallel_ver produce the same results.
     """
     target, source = generate_test_data
+    if with_outliers:
+        # Points far outside the target's reach: rejected by the max_dist gate.
+        source = np.vstack([source[:10] + 50.0, source])
     source = source.astype(np.float32)
     icp = ICP(max_iter=10, max_dist=2.0, tol=1e-3)
     icp.set_target(target)

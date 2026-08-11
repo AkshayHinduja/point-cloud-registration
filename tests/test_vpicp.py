@@ -19,15 +19,18 @@ def generate_test_data():
     return target, normals, source
 
 
-def test_calc_H_g_e2(generate_test_data):
+@pytest.mark.parametrize("with_outliers", [False, True], ids=["all_inliers", "with_outliers"])
+def test_calc_H_g_e2(generate_test_data, with_outliers):
     """
-    Test that calc_H_g_e2 and calc_H_g_e2x produce the same results.
+    Test that calc_H_g_e2 and calc_H_g_e2_no_parallel_ver produce the same results.
     """
-    target, normals, source = generate_test_data
+    target, _, source = generate_test_data
+    if with_outliers:
+        # Points far outside the target's reach: rejected by the max_dist gate.
+        source = np.vstack([source[:10] + 50.0, source])
     source = source.astype(np.float32)
     plane_icp = VPlaneICP(voxel_size=1.0, max_iter=10, max_dist=2.0, tol=1e-3)
     plane_icp.set_target(target)
-    plane_icp.normal = normals
 
     cur_T = np.eye(4)  # Initial transformation (identity matrix)
 

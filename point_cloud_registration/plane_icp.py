@@ -83,18 +83,17 @@ class PlaneICP(Registration):
         means = self.target[idx]
         norms = self.normal[idx]
         src_trans = src_trans[mask]
+        src_mask = source[mask]
 
         H = np.zeros((6, 6))
         g = np.zeros(6)
         e2 = 0
-        for i in range(source.shape[0]):
+        for i in range(src_mask.shape[0]):
             n = norms[i]
             r = n @ (src_trans[i] - means[i])
             J = np.zeros((1, 6))
             J[0, :3] = n
-            J[0, 3:] = skew(source[i]) @ (R.T @ n.T)
-            if np.abs(r) > self.max_dist:
-                continue
+            J[0, 3:] = skew(src_mask[i]) @ (R.T @ n.T)
             H += J.T @ J
             g += J[0] * r
             e2 += r * r
