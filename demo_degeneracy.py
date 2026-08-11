@@ -30,8 +30,8 @@ Usage:
     python3 demo_degeneracy.py --save              # write imgs/degeneracy_*.png
     python3 demo_degeneracy.py --case stair --save
 
-The library itself stays NumPy-only; matplotlib is imported by this demo
-alone (pip install matplotlib).
+matplotlib is imported by this demo alone (pip install matplotlib); the
+degeneracy feature adds no dependencies to the library.
 """
 import argparse
 import os

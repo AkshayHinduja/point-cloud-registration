@@ -135,8 +135,9 @@ On the synthetic staircase in `data/` only cross-step translation is
 unobservable: plain plane-ICP drifts centimetres along it, solution
 remapping holds it near the initial value while the other five DOFs
 still converge. On a flat plane three DOFs (tx, ty, yaw) are degenerate
-and the effect is an order of magnitude larger. The demo uses
-matplotlib only — the library itself stays NumPy-only.
+and the effect is an order of magnitude larger. matplotlib is needed
+only by this demo — the feature itself adds no dependencies to the
+library.
 
 ### Comparison of Registration Methods
 

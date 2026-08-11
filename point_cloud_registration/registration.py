@@ -163,10 +163,12 @@ class Registration:
 
         It is expressed in the right-tangent (body) frame of that pose, DOF
         order [tx, ty, tz, wx, wy, wz] — the increment coordinates consumed by
-        math_tools.plus().  Consumers that reason about world-frame directions
-        (covariance extraction, observability analysis) must congruence-
-        transform the translation block with the pose's rotation:
-        H_world = blockdiag(R, I) @ H @ blockdiag(R, I).T after mapping
-        dt_world = R @ dt_body.
+        math_tools.plus().  Consumers that reason about world-frame axes must
+        map directions through the returned pose: a body increment
+        [dt, w] moves the estimate by R @ dt (translation) and R @ w
+        (rotation axis) in the world; a full left-tangent (world-frame)
+        Hessian additionally carries the translation-rotation coupling and
+        is obtained with the SE(3) adjoint of the pose,
+        H_world = Ad^{-T} @ H @ Ad^{-1}.
         """
         return self._last_hessian
