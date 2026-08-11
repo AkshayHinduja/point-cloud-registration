@@ -41,16 +41,19 @@ class ICP(Registration):
         R = cur_T[:3, :3]
         S = skews(src_mask)
         S_sum = skew(np.sum(src_mask, axis=0))
+        # J = [R | -R@skew(p)]: the tangent-space increment dx is applied by
+        # plus() as T @ [expSO3(dx[3:]) | dx[:3]], so both blocks carry R.
+        # In H the R factors cancel (R.T@R = I), leaving these closed forms.
         H_ll = num * np.eye(3)
-        H_lr = - R @ S_sum
+        H_lr = - S_sum
         H_rr = skew2(src_mask)
         H = np.zeros((6, 6))
         H[:3, :3] = H_ll
         H[:3, 3:] = H_lr
         H[3:, :3] = H_lr.T
         H[3:, 3:] = H_rr
-        g0 = rs.sum(axis=0)
-        Rt_r = rs @ R  # row i is R.T @ rs[i]: the reference J is [I | -R@skew(p)]
+        Rt_r = rs @ R  # row i is R.T @ rs[i]
+        g0 = Rt_r.sum(axis=0)
         g1 = np.einsum('nij,ni->j', S, -Rt_r)
         g = np.hstack([g0, g1])
         e2 = np.sum(rs * rs)
@@ -77,8 +80,8 @@ class ICP(Registration):
         e2 = 0
         for i in range(num):
             J = np.zeros((3, 6))
-            # Jacobian of the transformation
-            J[:, :3] = np.eye(3)
+            # Jacobian of the translation (body-frame increment: t += R @ dt)
+            J[:, :3] = R
             # Jacobian of the rotation
             J[:, 3:] = -R @ skew(src_mask[i])
             # residual
