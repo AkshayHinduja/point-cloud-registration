@@ -17,6 +17,7 @@ class Registration:
         self.max_iter = max_iter
         self.tol = tol
         self._is_target_set = False
+        self._last_hessian = None
 
     def is_target_set(self):
         """
@@ -84,32 +85,46 @@ class Registration:
         # Copy: align() must not return the caller's array (or the shared
         # mutable np.eye(4) default) when it converges before the first step.
         cur_T = init_T.copy()
-        # dx_norm = np.inf
-        # best_T = cur_T
-        # best_error = np.inf
-        # source = source.astype(np.float32)
+        H_final = None
+        converged = False
+
         for i in range(self.max_iter):
             H, g, e2 = self.calc_H_g_e2(cur_T, source)
+            H_final = H
             if verbose:
                 print(f"iter {i}, error {e2}")
 
-            # # ensure the error is decreasing
-            # if e2 < best_error:
-            #     best_error = e2
-            #     best_T = cur_T.copy()
-            # else:
-            #     break
-
-            
             # solve the linear system
             dx = -np.linalg.solve(H, g)
-    
+
             # check convergence
             dx_norm = np.linalg.norm(dx)
             if dx_norm < self.tol:
+                converged = True
                 break
 
             # Update transformation
             cur_T = plus(cur_T, dx)
 
+        # If max_iter was exhausted, cur_T advanced past the last
+        # linearization, so recompute the Hessian at the returned pose.
+        if not converged and H_final is not None:
+            H_final, _, _ = self.calc_H_g_e2(cur_T, source)
+        self._last_hessian = H_final
         return cur_T
+
+    @property
+    def last_hessian(self):
+        """
+        The 6x6 Gauss-Newton Hessian (J^T W J) evaluated at the pose returned
+        by the most recent align() call, or None before any align().
+
+        It is expressed in the right-tangent (body) frame of that pose, DOF
+        order [tx, ty, tz, wx, wy, wz] — the increment coordinates consumed by
+        math_tools.plus().  Consumers that reason about world-frame directions
+        (covariance extraction, observability analysis) must congruence-
+        transform the translation block with the pose's rotation:
+        H_world = blockdiag(R, I) @ H @ blockdiag(R, I).T after mapping
+        dt_world = R @ dt_body.
+        """
+        return self._last_hessian
