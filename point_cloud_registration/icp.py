@@ -50,7 +50,7 @@ class ICP(Registration):
         H[3:, :3] = H_lr.T
         H[3:, 3:] = H_rr
         g0 = rs.sum(axis=0)
-        Rt_r = rs @ R.T
+        Rt_r = rs @ R  # row i is R.T @ rs[i]: the reference J is [I | -R@skew(p)]
         g1 = np.einsum('nij,ni->j', S, -Rt_r)
         g = np.hstack([g0, g1])
         e2 = np.sum(rs * rs)
