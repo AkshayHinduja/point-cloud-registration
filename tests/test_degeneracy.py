@@ -100,6 +100,26 @@ class TestAnalyseHessian:
         assert deg.num_constrained_dof == 0
         assert deg.V_constrained.shape == (0, 6)
 
+    def test_structural_zero_alone_is_degenerate(self):
+        """
+        A structural zero stays degenerate even when the adaptive threshold
+        lands below it: five equal 1e12 eigenvalues give a threshold of
+        sqrt(1e12/1e12) = 1, yet the 10.0 direction is eleven orders of
+        magnitude weaker and must not be reported constrained.
+        """
+        H = np.diag([1e12, 1e12, 1e12, 1e12, 1e12, 10.0])
+        deg = analyse_hessian(H)
+        assert deg.num_constrained_dof == 5
+        assert deg.degenerate_mask[0]  # ascending order puts 10.0 first
+        assert deg.condition_number == pytest.approx(1.0)
+
+    def test_structural_zero_combines_with_cn_test(self):
+        """Phase 1 (structural zeros) and phase 2 (cn test) OR together."""
+        H = np.diag([1e12, 1e12, 1e12, 1e12, 1e3, 1e-6])
+        deg = analyse_hessian(H)
+        # 1e-6 is a structural zero; 1e3 fails the cn test (~3.2e4).
+        assert deg.num_constrained_dof == 4
+
 
 class TestApplySRSolve:
     def test_degenerate_direction_zeroed(self):

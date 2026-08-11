@@ -41,9 +41,13 @@ All 6-vectors and 6×6 matrices here use this library's tangent-space ordering::
 
 i.e. translation first, rotation second — the ordering consumed by
 ``math_tools.plus()`` and produced by the ``calc_H_g_e2()`` methods of the
-registration classes.  Callers that work in a different convention (for example
-a factor-graph library that orders rotation first) must permute ``H`` and ``g``
-before calling and permute the returned step back afterwards.
+registration classes.  These are right-tangent (body-frame) increments: the
+step is applied as ``T @ [expSO3(dx[3:]) | dx[:3]]``, so the eigenvectors of
+``H`` — and therefore the directions this module classifies and zeroes — are
+body-frame directions of the current estimate.  Callers that work in a
+different convention (for example a factor-graph library that orders rotation
+first, or reasons in world-frame axes) must permute or rotate ``H`` and ``g``
+before calling and map the returned step back afterwards.
 
 This module depends on NumPy only.
 """
@@ -190,7 +194,12 @@ def analyse_hessian(
             lam_min_pos = float(eigenvalues[~struct_zero_mask][0])
             condition_number = float(np.sqrt(lam_max / lam_min_pos))
             threshold = condition_number
-            degenerate_mask = eigenvalues < threshold
+            # Structural zeros are degenerate no matter where the adaptive
+            # threshold lands: with a tight non-zero spectrum the threshold
+            # can fall below the structural-zero cutoff (e.g. five equal
+            # large eigenvalues give threshold 1), and the phase-1 verdict
+            # must not be overwritten by the phase-2 test.
+            degenerate_mask = (eigenvalues < threshold) | struct_zero_mask
 
     constrained_indices = np.where(~degenerate_mask)[0]
     num_constrained = int(len(constrained_indices))

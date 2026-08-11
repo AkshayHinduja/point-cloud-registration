@@ -1,11 +1,10 @@
 """
-Tests for Registration.align(): Hessian bookkeeping, optional Levenberg-Marquardt
-damping, and solution remapping on degenerate geometry.
+Behavioral tests for Registration.align().
 """
-
 import numpy as np
 import pytest
 
+from point_cloud_registration.icp import ICP
 from point_cloud_registration.plane_icp import PlaneICP
 from point_cloud_registration.math_tools import expSO3, makeT
 
@@ -16,8 +15,8 @@ def well_conditioned_pair():
     Three mutually orthogonal planes ("corner") — normals span R^3, so all six
     DOF are constrained and the Hessian is well conditioned.
 
-    Returns (target, source, T_true) where T_true is the transform align() should
-    recover, i.e. the one that maps source onto target.
+    Returns (target, source, T_true) where T_true is the transform align()
+    should recover, i.e. the one that maps source onto target.
     """
     rng = np.random.default_rng(0)
     n = 400
@@ -75,8 +74,8 @@ def test_last_hessian_lifecycle(well_conditioned_pair):
 def test_last_hessian_recomputed_when_max_iter_exhausted(well_conditioned_pair):
     """
     When align() runs out of iterations, cur_T has advanced past the last
-    linearization, so the stored Hessian must be recomputed at the returned pose
-    rather than left at the pre-step one.
+    linearization, so the stored Hessian must be recomputed at the returned
+    pose rather than left at the pre-step one.
     """
     target, source, _ = well_conditioned_pair
     engine = PlaneICP(max_iter=1, max_dist=2.0, tol=1e-6)
@@ -94,6 +93,33 @@ def test_last_hessian_recomputed_when_max_iter_exhausted(well_conditioned_pair):
     assert not np.allclose(engine.last_hessian, H_at_init), (
         "last_hessian is stale (equals the pre-step Hessian)"
     )
+
+
+def test_align_does_not_alias_init_T():
+    """
+    align() must return a transform the caller owns.
+
+    With source == target the very first step is ~zero, so align()
+    converges before ever calling plus(): without the defensive copy it
+    returns the init_T object itself — and with the mutable np.eye(4)
+    default, a caller mutating the result silently corrupts the default
+    for every subsequent align() call in the process.
+    """
+    np.random.seed(1)
+    target = np.random.rand(100, 3)
+    icp = ICP(max_iter=10, max_dist=2.0, tol=1e-3)
+    icp.set_target(target)
+    source = target.astype(np.float32)
+
+    init_T = np.eye(4)
+    T = icp.align(source, init_T=init_T)
+    assert T is not init_T
+
+    # Mutating the result must not corrupt the shared default argument.
+    T_default = icp.align(source)
+    T_default[0, 3] = 123.0
+    T_again = icp.align(source)
+    np.testing.assert_allclose(T_again, np.eye(4), atol=1e-6)
 
 
 def test_lm_damping_rescues_singular_hessian(degenerate_pair):
@@ -160,6 +186,37 @@ def test_solution_remapping_zeroes_degenerate_directions(degenerate_pair):
     assert abs(_yaw(T)) < 1e-6, f"yaw moved along a degenerate direction: {_yaw(T)}"
     # The source sits 0.5 above the target plane, so align must pull it back down.
     assert T[2, 3] == pytest.approx(-0.5, abs=1e-3), f"z did not converge: {T[2, 3]}"
+
+
+def test_solution_remapping_no_world_leak_under_rotated_init(degenerate_pair):
+    """
+    The same flat plane, but starting from a rotated initial guess.
+
+    The unobservable directions of the scene are world x, y and yaw; SR zeroes
+    the step in the body frame, and because H and the step share the body
+    frame of the retraction, the accumulated world-frame motion must still
+    have no component along them.  Before the body-frame Jacobian fix this
+    leaked ~0.13 m into world y at a 0.25 rad initial roll.
+    """
+    from point_cloud_registration.math_tools import transform_points
+
+    target, source = degenerate_pair
+
+    engine = PlaneICP(max_iter=50, max_dist=2.0, tol=1e-8)
+    engine.set_target(target)
+
+    init_T = makeT(expSO3(np.array([0.25, 0.0, 0.0])), np.zeros(3))
+    T = engine.align(source, init_T=init_T,
+                     use_solution_remapping=True, lm_damping=True)
+
+    assert np.all(np.isfinite(T))
+    assert abs(T[0, 3]) < 1e-6, f"x leaked: {T[0, 3]}"
+    assert abs(T[1, 3]) < 1e-6, f"y leaked: {T[1, 3]}"
+    assert abs(_yaw(T)) < 1e-6, f"yaw leaked: {_yaw(T)}"
+    # The observable directions must still do their job: the aligned source
+    # has to land on the z=0 target plane.
+    aligned = transform_points(T, source)
+    assert np.max(np.abs(aligned[:, 2])) < 1e-3
 
 
 def test_default_behaviour_converges_to_ground_truth(well_conditioned_pair):

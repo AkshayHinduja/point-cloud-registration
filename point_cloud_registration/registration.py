@@ -18,6 +18,7 @@ class Registration:
         self.max_iter = max_iter
         self.tol = tol
         self._is_target_set = False
+        self._last_hessian = None
 
     def is_target_set(self):
         """
@@ -73,17 +74,21 @@ class Registration:
               use_solution_remapping=False, sr_lambda_threshold=None,
               lm_damping=False):
         """
-        Gauss-Newton ICP alignment.
+        Gauss-Newton alignment of the source cloud onto the target.
+
+        The per-iteration step dx is a body-frame right-tangent increment
+        applied as T @ [expSO3(dx[3:]) | dx[:3]] (see math_tools.plus).
 
         :param source: Source point cloud (Nx3 array).
         :param init_T: Initial transformation (4x4 array).
         :param verbose: Print error at each iteration.
-        :param use_solution_remapping: If True, zero the step in degenerate Hessian
-            eigenvector directions at each iteration (SR mode; Hinduja, Ho &
-            Kaess, IROS 2019, Algorithm 1 — solution remapping per Zhang,
-            Kaess & Singh, ICRA 2016; see degeneracy.py for full references).
-        :param sr_lambda_threshold: Override the condition-number threshold for SR.
-            None = adaptive (sqrt(lambda_max / lambda_min)).
+        :param use_solution_remapping: If True, zero the step in degenerate
+            Hessian eigenvector directions at each iteration (SR mode;
+            Hinduja, Ho & Kaess, IROS 2019, Algorithm 1 — solution remapping
+            per Zhang, Kaess & Singh, ICRA 2016; see degeneracy.py for full
+            references).
+        :param sr_lambda_threshold: Override the condition-number threshold
+            for SR. None = adaptive (sqrt(lambda_max / lambda_min)).
         :param lm_damping: If True, solve the damped system (H + lambda*I) dx = -g
             instead of H dx = -g, with lambda scaled to the trace of H
             (Levenberg-Marquardt). This keeps the linear solve well posed on
@@ -101,14 +106,15 @@ class Registration:
             raise ValueError("Target is not set.")
 
         source = source.astype(np.float32)
-        cur_T = init_T
+        # Copy: align() must not return the caller's array (or the shared
+        # mutable np.eye(4) default) when it converges before the first step.
+        cur_T = init_T.copy()
         H_final = None
         converged = False
 
         for i in range(self.max_iter):
             H, g, e2 = self.calc_H_g_e2(cur_T, source)
             H_final = H
-
             if verbose:
                 print(f"iter {i}, error {e2}")
 
@@ -133,14 +139,17 @@ class Registration:
             else:
                 dx = -np.linalg.solve(H, g)
 
+            # check convergence
             dx_norm = np.linalg.norm(dx)
             if dx_norm < self.tol:
                 converged = True
                 break
 
+            # Update transformation
             cur_T = plus(cur_T, dx)
 
-        # If max_iter was exhausted, cur_T advanced past the last H computation — recompute.
+        # If max_iter was exhausted, cur_T advanced past the last
+        # linearization, so recompute the Hessian at the returned pose.
         if not converged and H_final is not None:
             H_final, _, _ = self.calc_H_g_e2(cur_T, source)
         self._last_hessian = H_final
@@ -148,5 +157,18 @@ class Registration:
 
     @property
     def last_hessian(self):
-        """Return the 6×6 Hessian from the most recent align() call, or None."""
-        return getattr(self, '_last_hessian', None)
+        """
+        The 6x6 Gauss-Newton Hessian (J^T W J) evaluated at the pose returned
+        by the most recent align() call, or None before any align().
+
+        It is expressed in the right-tangent (body) frame of that pose, DOF
+        order [tx, ty, tz, wx, wy, wz] — the increment coordinates consumed by
+        math_tools.plus().  Consumers that reason about world-frame axes must
+        map directions through the returned pose: a body increment
+        [dt, w] moves the estimate by R @ dt (translation) and R @ w
+        (rotation axis) in the world; a full left-tangent (world-frame)
+        Hessian additionally carries the translation-rotation coupling and
+        is obtained with the SE(3) adjoint of the pose,
+        H_world = Ad^{-T} @ H @ Ad^{-1}.
+        """
+        return self._last_hessian

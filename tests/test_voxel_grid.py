@@ -153,6 +153,12 @@ def test_default_cov_reg_equals_explicit_zero(dense_cloud):
     assert np.array_equal(default.norm, explicit.norm)
 
 
+def test_negative_cov_reg_is_rejected():
+    """A negative shift would make covariances indefinite: reject, not ignore."""
+    with pytest.raises(ValueError, match="cov_reg"):
+        VoxelGrid(VOXEL_SIZE, cov_reg=-1e-3)
+
+
 def test_default_cov_reg_matches_hand_computed_statistics(tiny_two_voxel_cloud):
     """
     With cov_reg at its default the per-voxel mean/covariance/normal must equal

@@ -60,6 +60,8 @@ class VoxelGrid:
         :param cov_reg: Isotropic shift added to every per-voxel covariance.
             0.0 (the default) leaves the covariances untouched.
         """
+        if cov_reg < 0.0:
+            raise ValueError(f"cov_reg must be >= 0.0, got {cov_reg}")
         self.voxel_size = voxel_size
         self.kdtree = None
         self.min_points = min_points
